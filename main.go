@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgconn"
 	"github.com/jackc/pglogrepl"
-	"github.com/jackc/pgproto3/v2"
-	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const debugOutput = true
+const debugOutput = false
 
 func main() {
 	const outputPlugin = "pgoutput" // https://wiki.postgresql.org/wiki/Logical_Decoding_Plugins
@@ -25,7 +25,7 @@ func main() {
 
 	sysident, err := pglogrepl.IdentifySystem(ctx, conn)
 	panicOnErr(err, "IdentifySystem failed:")
-	sysident.XLogPos = 22526648
+	// sysident.XLogPos = 22526648
 
 	log("SystemID:", sysident.SystemID, "Timeline:", sysident.Timeline, "XLogPos:", sysident.XLogPos, "DBName:", sysident.DBName)
 
@@ -48,7 +48,7 @@ func main() {
 
 	clientXLogPos := sysident.XLogPos
 	relations := map[uint32]*pglogrepl.RelationMessage{}
-	connInfo := pgtype.NewConnInfo()
+	typeMap := pgtype.NewMap()
 
 	for {
 		rawMsg, err := conn.ReceiveMessage(ctx)
@@ -77,13 +77,16 @@ func main() {
 		case pglogrepl.XLogDataByteID:
 			xld, err := pglogrepl.ParseXLogData(msg)
 			panicOnErr(err, "parse xlogData")
-			debug("XLogData =>", "WALStart", xld.WALStart, "ServerWALEnd", xld.ServerWALEnd, "ServerTime:", xld.ServerTime, "WALData", string(xld.WALData))
+			debug("XLogData =>", "WALStart", xld.WALStart, "ServerWALEnd", xld.ServerWALEnd, "ServerTime:", xld.ServerTime)
 
 			logicalMsg, err := pglogrepl.Parse(xld.WALData)
 			panicOnErr(err, "parse logical replication message")
 
 			debug("Receive a logical replication message", logicalMsg.Type())
 			switch logicalMsg := logicalMsg.(type) {
+
+			// https://www.postgresql.org/docs/current/protocol-logical-replication.html
+			// Every DML message contains a relation OID, identifying the publisher's relation that was acted on. Before the first DML message for a given relation OID, a Relation message will be sent, describing the schema of that relation. Subsequently, a new Relation message will be sent if the relation's definition has changed since the last Relation message was sent for it. (The protocol assumes that the client is capable of remembering this metadata for as many relations as needed.)
 			case *pglogrepl.RelationMessage:
 				relations[logicalMsg.RelationID] = logicalMsg
 				log("Got relation Message", logicalMsg)
@@ -106,7 +109,7 @@ func main() {
 					case 'u': // unchanged toast
 						// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
 					case 't': // text
-						val, err := decodeTextColumnData(connInfo, col.Data, rel.Columns[idx].DataType)
+						val, err := decodeTextColumnData(typeMap, col.Data, rel.Columns[idx].DataType)
 						panicOnErr(err, "error decoding column data")
 						values[colName] = val
 					}
@@ -164,20 +167,11 @@ func handleKeepAliveMsg(ctx context.Context, conn *pgconn.PgConn, msg []byte, po
 	return nil
 }
 
-func decodeTextColumnData(ci *pgtype.ConnInfo, data []byte, dataType uint32) (interface{}, error) {
-	var decoder pgtype.TextDecoder
-	if dt, ok := ci.DataTypeForOID(dataType); ok {
-		decoder, ok = dt.Value.(pgtype.TextDecoder)
-		if !ok {
-			decoder = &pgtype.GenericText{}
-		}
-	} else {
-		decoder = &pgtype.GenericText{}
+func decodeTextColumnData(mi *pgtype.Map, data []byte, dataType uint32) (interface{}, error) {
+	if dt, ok := mi.TypeForOID(dataType); ok {
+		return dt.Codec.DecodeValue(mi, dataType, pgtype.TextFormatCode, data)
 	}
-	if err := decoder.DecodeText(ci, data); err != nil {
-		return nil, err
-	}
-	return decoder.(pgtype.Value).Get(), nil
+	return string(data), nil
 }
 
 func logf(v string, args ...any) {
