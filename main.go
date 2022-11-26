@@ -1,8 +1,11 @@
+// original code: https://github.com/jackc/pglogrepl/blob/master/example/pglogrepl_demo/main.go
 package main
 
 import (
 	"context"
 	"fmt"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -17,7 +20,7 @@ func main() {
 	const outputPlugin = "pgoutput" // https://wiki.postgresql.org/wiki/Logical_Decoding_Plugins
 	const slotName = "groceries_pub"
 
-	ctx := context.Background()
+	ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
 	conn, err := pgconn.Connect(ctx, "postgres://postgres:test@localhost:5432?replication=database")
 	panicOnErr(err, "failed to connect to PostgreSQL server")
@@ -47,8 +50,7 @@ func main() {
 	log("Logical replication started on slot", slotName)
 
 	clientXLogPos := sysident.XLogPos
-	relations := map[uint32]*pglogrepl.RelationMessage{}
-	typeMap := pgtype.NewMap()
+	msgParser := newLogicalMsgParser()
 
 	for {
 		rawMsg, err := conn.ReceiveMessage(ctx)
@@ -74,80 +76,106 @@ func main() {
 			err := handleKeepAliveMsg(ctx, conn, msg, clientXLogPos)
 			panicOnErr(err, "ParsePrimaryKeepaliveMessage failed")
 
+		// https://www.postgresql.org/docs/current/protocol-logical-replication.html#PROTOCOL-LOGICAL-MESSAGES
 		case pglogrepl.XLogDataByteID:
 			xld, err := pglogrepl.ParseXLogData(msg)
 			panicOnErr(err, "parse xlogData")
 			debug("XLogData =>", "WALStart", xld.WALStart, "ServerWALEnd", xld.ServerWALEnd, "ServerTime:", xld.ServerTime)
 
-			logicalMsg, err := pglogrepl.Parse(xld.WALData)
+			err = msgParser.Handle(xld.WALData)
 			panicOnErr(err, "parse logical replication message")
-
-			debug("Receive a logical replication message", logicalMsg.Type())
-			switch logicalMsg := logicalMsg.(type) {
-
-			// https://www.postgresql.org/docs/current/protocol-logical-replication.html
-			// Every DML message contains a relation OID, identifying the publisher's relation that was acted on. Before the first DML message for a given relation OID, a Relation message will be sent, describing the schema of that relation. Subsequently, a new Relation message will be sent if the relation's definition has changed since the last Relation message was sent for it. (The protocol assumes that the client is capable of remembering this metadata for as many relations as needed.)
-			case *pglogrepl.RelationMessage:
-				relations[logicalMsg.RelationID] = logicalMsg
-				log("Got relation Message", logicalMsg)
-			case *pglogrepl.BeginMessage:
-				// Indicates the beginning of a group of changes in a transaction. This is only sent for committed transactions. You won't get any events from rolled back transactions.
-			case *pglogrepl.CommitMessage:
-			case *pglogrepl.InsertMessage:
-				rel, ok := relations[logicalMsg.RelationID]
-				if !ok {
-					log("unknown relation ID:", logicalMsg.RelationID)
-					continue
-				}
-
-				values := map[string]interface{}{}
-				for idx, col := range logicalMsg.Tuple.Columns {
-					colName := rel.Columns[idx].Name
-					switch col.DataType {
-					case 'n': // null
-						values[colName] = nil
-					case 'u': // unchanged toast
-						// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
-					case 't': // text
-						val, err := decodeTextColumnData(typeMap, col.Data, rel.Columns[idx].DataType)
-						panicOnErr(err, "error decoding column data")
-						values[colName] = val
-					}
-				}
-				logf("INSERT INTO %s.%s: %v", rel.Namespace, rel.RelationName, values)
-
-			case *pglogrepl.UpdateMessage:
-				rel, ok := relations[logicalMsg.RelationID]
-				if !ok {
-					log("unknown relation ID update %d", logicalMsg.RelationID)
-					continue
-				}
-
-				logf("Got update message %T: %T", rel, logicalMsg)
-			case *pglogrepl.DeleteMessage:
-				rel, ok := relations[logicalMsg.RelationID]
-				if !ok {
-					logf("unknown relation ID %d", logicalMsg.RelationID)
-					continue
-				}
-
-				logf("Got delete message for rel %T: %T", rel, logicalMsg)
-			case *pglogrepl.TruncateMessage:
-				logf("Got truncate message: %T", logicalMsg)
-
-			case *pglogrepl.TypeMessage:
-				logf("Got type message: %T", logicalMsg)
-			case *pglogrepl.OriginMessage:
-				logf("Got truncate message: %T", logicalMsg)
-			default:
-				logf("Unknown message type in pgoutput stream: %T", logicalMsg)
-			}
 
 			clientXLogPos = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
 		default:
 			logf("Unknown data type in pgoutput stream: %v", data.Data[0])
 		}
 	}
+}
+
+type logicalMsgParser struct {
+	relations map[uint32]*pglogrepl.RelationMessage
+	typeMap   *pgtype.Map
+}
+
+func (p *logicalMsgParser) Handle(walData []byte) error {
+	logicalMsg, err := pglogrepl.Parse(walData)
+	panicOnErr(err, "parse logical replication message")
+
+	switch logicalMsg := logicalMsg.(type) {
+	case *pglogrepl.RelationMessage:
+		// https://www.postgresql.org/docs/current/protocol-logical-replication.html
+		// Every DML message contains a relation OID, identifying the publisher's relation that was acted on. Before the first DML message for a given relation OID, a Relation message will be sent, describing the schema of that relation. Subsequently, a new Relation message will be sent if the relation's definition has changed since the last Relation message was sent for it. (The protocol assumes that the client is capable of remembering this metadata for as many relations as needed.)
+		p.relations[logicalMsg.RelationID] = logicalMsg
+		debug("Got relation Message", logicalMsg)
+	case *pglogrepl.BeginMessage:
+		// Indicates the beginning of a group of changes in a transaction. This is only sent for committed transactions. You won't get any events from rolled back transactions.
+	case *pglogrepl.CommitMessage:
+	case *pglogrepl.InsertMessage:
+		dataChange, err := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.Tuple.Columns)
+		if err != nil {
+			return fmt.Errorf("failed to decode insert msg: %v", err)
+		}
+
+		logf("INSERT INTO %s.%s: %v", dataChange.Namespace, dataChange.TableName, dataChange.Values)
+	case *pglogrepl.UpdateMessage:
+		dataChange, err := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.NewTuple.Columns)
+		if err != nil {
+			return fmt.Errorf("failed to decode insert msg: %v", err)
+		}
+
+		logf("UPDATE %s.%s: %v", dataChange.Namespace, dataChange.TableName, dataChange.Values)
+	case *pglogrepl.DeleteMessage:
+		dataChange, err := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.OldTuple.Columns)
+		if err != nil {
+			return fmt.Errorf("failed to decode insert msg: %v", err)
+		}
+
+		logf("DELETE FROM %s.%s: %v", dataChange.Namespace, dataChange.TableName, dataChange.Values)
+	case *pglogrepl.TruncateMessage:
+		logf("Got truncate message: %T", logicalMsg)
+
+	case *pglogrepl.TypeMessage:
+		// https://www.postgresql.org/docs/current/protocol-logical-replication.html
+		// For a non-built-in type OID, a Type message will be sent before the Relation message, to provide the type name associated with that OID. Thus, a client that needs to specifically identify the types of relation columns should cache the contents of Type messages, and first consult that cache to see if the type OID is defined there. If not, look up the type OID locally.
+		logf("Got type message: %T", logicalMsg)
+	case *pglogrepl.OriginMessage:
+		// Every sent transaction contains zero or more DML messages (Insert, Update, Delete). In case of a cascaded setup it can also contain Origin messages. The origin message indicates that the transaction originated on different replication node. Since a replication node in the scope of logical replication protocol can be pretty much anything, the only identifier is the origin name. It's downstream's responsibility to handle this as needed (if needed). The Origin message is always sent before any DML messages in the transaction.
+		logf("Got origin message: %T", logicalMsg)
+	default:
+		logf("Unknown message type in pgoutput stream: %T", logicalMsg)
+	}
+	return nil
+}
+
+func newLogicalMsgParser() logicalMsgParser {
+	return logicalMsgParser{
+		relations: map[uint32]*pglogrepl.RelationMessage{},
+		typeMap:   pgtype.NewMap(),
+	}
+}
+
+func (p *logicalMsgParser) decodeColumnData(relationID uint32, columns []*pglogrepl.TupleDataColumn) (rowData, error) {
+	rel, ok := p.relations[relationID]
+	if !ok {
+		return rowData{}, fmt.Errorf("unknown relation ID: %d", relationID)
+	}
+
+	values := map[string]interface{}{}
+	for idx, col := range columns {
+		colName := rel.Columns[idx].Name
+		switch col.DataType {
+		case 'n': // null
+			values[colName] = nil
+		case 'u': // unchanged toast
+			// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
+		case 't': // text
+			val, err := decodeTextColumnData(p.typeMap, col.Data, rel.Columns[idx].DataType)
+			panicOnErr(err, "error decoding column data")
+			values[colName] = val
+		}
+	}
+
+	return rowData{Namespace: rel.Namespace, TableName: rel.RelationName, Values: values}, nil
 }
 
 func handleKeepAliveMsg(ctx context.Context, conn *pgconn.PgConn, msg []byte, pos pglogrepl.LSN) error {
@@ -167,11 +195,17 @@ func handleKeepAliveMsg(ctx context.Context, conn *pgconn.PgConn, msg []byte, po
 	return nil
 }
 
-func decodeTextColumnData(mi *pgtype.Map, data []byte, dataType uint32) (interface{}, error) {
+func decodeTextColumnData(mi *pgtype.Map, data []byte, dataType uint32) (any, error) {
 	if dt, ok := mi.TypeForOID(dataType); ok {
 		return dt.Codec.DecodeValue(mi, dataType, pgtype.TextFormatCode, data)
 	}
 	return string(data), nil
+}
+
+type rowData struct {
+	Namespace string
+	TableName string
+	Values    map[string]any
 }
 
 func logf(v string, args ...any) {
