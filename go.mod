@@ -3,6 +3,7 @@ module playground/pg-repl
 go 1.19
 
 require (
+	github.com/gorilla/websocket v1.5.0
 	github.com/jackc/pglogrepl v0.0.0-20221028002905-994c5de07171
 	github.com/jackc/pgx/v5 v5.1.1
 )
