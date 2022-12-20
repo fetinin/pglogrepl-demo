@@ -55,41 +55,22 @@ func main() {
 	msgParser := newLogicalMsgParser()
 
 	for {
-		rawMsg, err := conn.ReceiveMessage(ctx)
-		if err != nil {
-			panicOnErr(err, "ReceiveMessage failed")
-		}
-
-		if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
-			logf("received Postgres WAL error: %+v", errMsg)
-			continue
-		}
-
-		data, ok := rawMsg.(*pgproto3.CopyData)
-		if !ok {
-			logf("Received unexpected message: %T", rawMsg)
-			continue
-		}
+		rawMsg, _ := conn.ReceiveMessage(ctx)
+		data, _ := rawMsg.(*pgproto3.CopyData)
 
 		// https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html
 		msgIdentifier, msg := data.Data[0], data.Data[1:]
 		switch msgIdentifier {
 		case pglogrepl.PrimaryKeepaliveMessageByteID:
-			err := handleKeepAliveMsg(ctx, conn, msg, clientXLogPos)
-			panicOnErr(err, "ParsePrimaryKeepaliveMessage failed")
+			_ = handleKeepAliveMsg(ctx, conn, msg, clientXLogPos)
 
 		// https://www.postgresql.org/docs/current/protocol-logical-replication.html#PROTOCOL-LOGICAL-MESSAGES
 		case pglogrepl.XLogDataByteID:
-			xld, err := pglogrepl.ParseXLogData(msg)
-			panicOnErr(err, "parse xlogData")
-			debug("XLogData =>", "WALStart", xld.WALStart, "ServerWALEnd", xld.ServerWALEnd, "ServerTime:", xld.ServerTime)
+			xld, _ := pglogrepl.ParseXLogData(msg)
 
-			err = msgParser.Handle(xld.WALData)
-			panicOnErr(err, "parse logical replication message")
+			_ = msgParser.Handle(xld.WALData)
 
 			clientXLogPos = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
-		default:
-			logf("Unknown data type in pgoutput stream: %v", data.Data[0])
 		}
 	}
 }
@@ -100,8 +81,7 @@ type logicalMsgParser struct {
 }
 
 func (p *logicalMsgParser) Handle(walData []byte) error {
-	logicalMsg, err := pglogrepl.Parse(walData)
-	panicOnErr(err, "parse logical replication message")
+	logicalMsg, _ := pglogrepl.Parse(walData)
 
 	switch logicalMsg := logicalMsg.(type) {
 	case *pglogrepl.RelationMessage:
@@ -120,25 +100,13 @@ func (p *logicalMsgParser) Handle(walData []byte) error {
 	case *pglogrepl.CommitMessage:
 
 	case *pglogrepl.InsertMessage:
-		dataChange, err := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.Tuple.Columns)
-		if err != nil {
-			return fmt.Errorf("failed to decode insert msg: %v", err)
-		}
-
+		dataChange, _ := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.Tuple.Columns)
 		logf("INSERT INTO %s.%s: %v", dataChange.Namespace, dataChange.TableName, dataChange.Values)
 	case *pglogrepl.UpdateMessage:
-		dataChange, err := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.NewTuple.Columns)
-		if err != nil {
-			return fmt.Errorf("failed to decode insert msg: %v", err)
-		}
-
+		dataChange, _ := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.NewTuple.Columns)
 		logf("UPDATE %s.%s: %v", dataChange.Namespace, dataChange.TableName, dataChange.Values)
 	case *pglogrepl.DeleteMessage:
-		dataChange, err := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.OldTuple.Columns)
-		if err != nil {
-			return fmt.Errorf("failed to decode insert msg: %v", err)
-		}
-
+		dataChange, _ := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.OldTuple.Columns)
 		logf("DELETE FROM %s.%s: %v", dataChange.Namespace, dataChange.TableName, dataChange.Values)
 	case *pglogrepl.TruncateMessage:
 		logf("Got truncate message: %T", logicalMsg)
@@ -186,7 +154,9 @@ func (p *logicalMsgParser) decodeColumnData(relationID uint32, columns []*pglogr
 		case 'u': // unchanged toast
 			// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
 		case 't': // text
-			val, err := decodeTextColumnData(p.typeMap, col.Data, rel.Columns[idx].DataType)
+			dataType := rel.Columns[idx].DataType
+			dt, _ := p.typeMap.TypeForOID(rel.Columns[idx].DataType)
+			val, err := dt.Codec.DecodeValue(p.typeMap, dataType, pgtype.TextFormatCode, col.Data)
 			panicOnErr(err, "error decoding column data")
 			values[colName] = val
 		}
