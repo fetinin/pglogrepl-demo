@@ -36,8 +36,9 @@ func main() {
 	panicOnErr(err, "CreateReplicationSlot failed:")
 
 	log("Created temporary replication slot", slotName)
+
 	pluginArguments := []string{
-		"proto_version '1'",
+		"proto_version '3'",
 		fmt.Sprintf("publication_names '%s'", slotName),
 	}
 	err = pglogrepl.StartReplication(
@@ -46,6 +47,7 @@ func main() {
 		sysident.XLogPos,
 		pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments},
 	)
+
 	panicOnErr(err, "StartReplication failed")
 	log("Logical replication started on slot", slotName)
 
@@ -104,12 +106,19 @@ func (p *logicalMsgParser) Handle(walData []byte) error {
 	switch logicalMsg := logicalMsg.(type) {
 	case *pglogrepl.RelationMessage:
 		// https://www.postgresql.org/docs/current/protocol-logical-replication.html
-		// Every DML message contains a relation OID, identifying the publisher's relation that was acted on. Before the first DML message for a given relation OID, a Relation message will be sent, describing the schema of that relation. Subsequently, a new Relation message will be sent if the relation's definition has changed since the last Relation message was sent for it. (The protocol assumes that the client is capable of remembering this metadata for as many relations as needed.)
+		// Every DML message contains a relation OID, identifying the publisher's relation that was acted on.
+		// Before the first DML message for a given relation OID, a Relation message will be sent,
+		// describing the schema of that relation. Subsequently, a new Relation message will be sent if the
+		// relation's definition has changed since the last Relation message was sent for it.
+		// (The protocol assumes that the client is capable of remembering this metadata for as many relations as needed.)
+
+		// relations map[uint32]*pglogrepl.RelationMessage
 		p.relations[logicalMsg.RelationID] = logicalMsg
-		debug("Got relation Message", logicalMsg)
 	case *pglogrepl.BeginMessage:
-		// Indicates the beginning of a group of changes in a transaction. This is only sent for committed transactions. You won't get any events from rolled back transactions.
+		// Indicates the beginning of a group of changes in a transaction. This is only sent for committed transactions.
+		// You won't get any events from rolled back transactions.
 	case *pglogrepl.CommitMessage:
+
 	case *pglogrepl.InsertMessage:
 		dataChange, err := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.Tuple.Columns)
 		if err != nil {
@@ -136,10 +145,18 @@ func (p *logicalMsgParser) Handle(walData []byte) error {
 
 	case *pglogrepl.TypeMessage:
 		// https://www.postgresql.org/docs/current/protocol-logical-replication.html
-		// For a non-built-in type OID, a Type message will be sent before the Relation message, to provide the type name associated with that OID. Thus, a client that needs to specifically identify the types of relation columns should cache the contents of Type messages, and first consult that cache to see if the type OID is defined there. If not, look up the type OID locally.
+		// For a non-built-in type OID, a Type message will be sent before the Relation message,
+		// to provide the type name associated with that OID. Thus, a client that needs to specifically identify
+		// the types of relation columns should cache the contents of Type messages, and first consult that cache
+		// to see if the type OID is defined there. If not, look up the type OID locally.
 		logf("Got type message: %T", logicalMsg)
 	case *pglogrepl.OriginMessage:
-		// Every sent transaction contains zero or more DML messages (Insert, Update, Delete). In case of a cascaded setup it can also contain Origin messages. The origin message indicates that the transaction originated on different replication node. Since a replication node in the scope of logical replication protocol can be pretty much anything, the only identifier is the origin name. It's downstream's responsibility to handle this as needed (if needed). The Origin message is always sent before any DML messages in the transaction.
+		// Every sent transaction contains zero or more DML messages (Insert, Update, Delete). In case of a cascaded
+		// setup it can also contain Origin messages. The origin message indicates that the transaction
+		// originated on different replication node. Since a replication node in the scope of logical replication protocol
+		// can be pretty much anything, the only identifier is the origin name.
+		// It's downstream's responsibility to handle this as needed (if needed).
+		// The Origin message is always sent before any DML messages in the transaction.
 		logf("Got origin message: %T", logicalMsg)
 	default:
 		logf("Unknown message type in pgoutput stream: %T", logicalMsg)
