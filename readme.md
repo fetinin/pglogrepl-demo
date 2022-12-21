@@ -11,3 +11,6 @@ This repo contains examples of how `github.com/jackc/pglogrepl` can be used.
 `simple` - contains minimalistic example that connects to database and writes all changes to log.  
 
 `server-example` - contains more sophisticated example that demonstrates how you can process database updates from DB and push changes to frontend.
+
+## Start DB
+You can start test DB by running `make db` in the root directory.
