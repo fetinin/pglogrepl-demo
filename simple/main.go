@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/signal"
 	"syscall"
@@ -55,7 +56,11 @@ func main() {
 	msgParser := newLogicalMsgParser()
 
 	for {
-		rawMsg, _ := conn.ReceiveMessage(ctx)
+		rawMsg, err := conn.ReceiveMessage(ctx)
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		panicOnErr(err, "receive msg")
 		data, _ := rawMsg.(*pgproto3.CopyData)
 
 		// https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html
