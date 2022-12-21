@@ -102,8 +102,9 @@ func (p *logicalMsgParser) Handle(walData []byte) error {
 	case *pglogrepl.BeginMessage:
 		// Indicates the beginning of a group of changes in a transaction. This is only sent for committed transactions.
 		// You won't get any events from rolled back transactions.
+		logf("BEGIN")
 	case *pglogrepl.CommitMessage:
-
+		logf("COMMIT")
 	case *pglogrepl.InsertMessage:
 		dataChange, _ := p.decodeColumnData(logicalMsg.RelationID, logicalMsg.Tuple.Columns)
 		logf("INSERT INTO %s.%s: %v", dataChange.Namespace, dataChange.TableName, dataChange.Values)
