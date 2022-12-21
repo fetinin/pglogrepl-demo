@@ -1,6 +1,6 @@
 # pglogrepl-demo
 
-This repo contains examples of how github.com/jackc/pglogrepl can be used.
+This repo contains examples of how `github.com/jackc/pglogrepl` can be used.
 
 ```
 .
